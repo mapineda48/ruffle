@@ -26,6 +26,29 @@ pub enum DynamicKey<'gc> {
     Object(Object<'gc>),
 }
 
+/// A key that can be stored in a `DynamicMap`.
+pub trait DynamicMapKey: Eq + Hash {
+    /// A hash to use instead of the general-purpose hasher, if any.
+    fn identity_hash(&self) -> Option<u64> {
+        None
+    }
+}
+
+impl DynamicMapKey for DynamicKey<'_> {
+    // avmplus hashes integer atoms by their value, so small integer keys
+    // occupy ascending slots and get enumerated in ascending order.
+    // Content relies on this (e.g. building arrays with `for each` over `{1: a, 2: b}`).
+    // See https://github.com/adobe/avmplus/blob/858d034a3bd3a54d9b70909386435cf4aec81d21/core/avmplusHashtable.cpp
+    fn identity_hash(&self) -> Option<u64> {
+        match self {
+            DynamicKey::Uint(index) => Some(u64::from(*index)),
+            _ => None,
+        }
+    }
+}
+
+impl DynamicMapKey for &'static str {}
+
 /// A HashMap designed for dynamic properties on an object.
 ///
 /// Uses `HashTable` directly to expose stable bucket indices, which are
@@ -44,15 +67,19 @@ pub struct DynamicMap<K, V> {
     real_index: Cell<usize>,
 }
 
-impl<K: Eq + Hash, V> Default for DynamicMap<K, V> {
+impl<K: DynamicMapKey, V> Default for DynamicMap<K, V> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<K: Eq + Hash, V> DynamicMap<K, V> {
+impl<K: DynamicMapKey, V> DynamicMap<K, V> {
+    fn hash_with(hasher: &FnvBuildHasher, key: &K) -> u64 {
+        key.identity_hash().unwrap_or_else(|| hasher.hash_one(key))
+    }
+
     fn hash_key(&self, key: &K) -> u64 {
-        self.hasher.hash_one(key)
+        Self::hash_with(&self.hasher, key)
     }
 
     pub fn new() -> Self {
@@ -116,10 +143,11 @@ impl<K: Eq + Hash, V> DynamicMap<K, V> {
     pub fn insert(&mut self, key: K, new_value: V) {
         let hash = self.hash_key(&key);
 
-        match self
-            .table
-            .entry(hash, |(k, _)| *k == key, |(k, _)| self.hasher.hash_one(k))
-        {
+        match self.table.entry(
+            hash,
+            |(k, _)| *k == key,
+            |(k, _)| Self::hash_with(&self.hasher, k),
+        ) {
             Entry::Occupied(mut occupied) => {
                 // NOTE: When inserting a new value into an already-occupied entry,
                 // the value of the `enumerable` field isn't reset to `true`
@@ -231,7 +259,24 @@ impl<K: Eq + Hash, V> DynamicMap<K, V> {
 #[cfg(test)]
 mod tests {
 
-    use super::DynamicMap;
+    use super::{DynamicKey, DynamicMap};
+
+    #[test]
+    fn test_uint_keys_enumerate_ascending() {
+        for keys in [[1, 2, 3, 4], [4, 3, 2, 1], [3, 1, 4, 2]] {
+            let mut map: DynamicMap<DynamicKey<'static>, u32> = DynamicMap::new();
+            for key in keys {
+                map.insert(DynamicKey::Uint(key), key * 100);
+            }
+            let mut values = vec![];
+            let mut current = 0;
+            while let Some(next) = map.next(current) {
+                values.push(*map.value_at(next).unwrap());
+                current = next;
+            }
+            assert_eq!(values, [100, 200, 300, 400], "inserted as {keys:?}");
+        }
+    }
 
     #[test]
     fn test_dynamic_map() {
