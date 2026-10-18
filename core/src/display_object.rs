@@ -360,7 +360,7 @@ impl Default for DisplayObjectBase<'_> {
             sound_transform: Default::default(),
             blend_mode: Default::default(),
             opaque_background: Default::default(),
-            flags: Cell::new(DisplayObjectFlags::VISIBLE),
+            flags: Cell::new(DisplayObjectFlags::VISIBLE | DisplayObjectFlags::NEEDS_FRAME_WORK),
             scroll_rect: Cell::new(None),
             next_scroll_rect: Default::default(),
             scaling_grid: Default::default(),
@@ -383,6 +383,35 @@ impl<'gc> DisplayObjectBase<'gc> {
     fn reset_for_movie_load(&self) {
         let flags_to_keep = self.flags.get() & DisplayObjectFlags::LOCK_ROOT;
         self.flags.set(flags_to_keep | DisplayObjectFlags::VISIBLE);
+        self.mark_frame_work();
+    }
+
+    pub fn needs_frame_work(&self) -> bool {
+        self.contains_flag(DisplayObjectFlags::NEEDS_FRAME_WORK)
+    }
+
+    /// Sets `NEEDS_FRAME_WORK` on this object and its ancestors.
+    pub fn mark_frame_work(&self) {
+        if self.needs_frame_work() {
+            // Its ancestors already have it too.
+            return;
+        }
+        self.set_flag(DisplayObjectFlags::NEEDS_FRAME_WORK, true);
+        let mut parent = self.parent.get();
+        let mut root = None;
+        while let Some(object) = parent {
+            let base = object.base();
+            if base.needs_frame_work() {
+                return;
+            }
+            base.set_flag(DisplayObjectFlags::NEEDS_FRAME_WORK, true);
+            root = Some(object);
+            parent = base.parent.get();
+        }
+        // A root other than the stage just got work: it may be an orphan.
+        if root.is_none_or(|root| root.as_stage().is_none()) {
+            bump_orphan_work_epoch();
+        }
     }
 
     fn depth(&self) -> Depth {
@@ -1932,6 +1961,12 @@ pub trait TDisplayObject<'gc>:
         DisplayObjectBase::set_parent_ignoring_orphan_list(write, parent);
         let parent_removed = had_parent && parent.is_none();
 
+        if let Some(parent) = parent
+            && self.base().needs_frame_work()
+        {
+            parent.base().mark_frame_work();
+        }
+
         if parent_removed {
             if let Some(int) = self.as_interactive() {
                 int.drop_focus(context);
@@ -2357,6 +2392,30 @@ pub trait TDisplayObject<'gc>:
     ///    as properties on the class
     fn construct_frame(self, _context: &mut UpdateContext<'gc>) {}
 
+    /// Whether `construct_frame` and `run_frame_scripts` would leave this object
+    /// unchanged, not counting its children. See `DisplayObjectFlags::NEEDS_FRAME_WORK`.
+    fn frame_work_settled(self) -> bool {
+        true
+    }
+
+    /// Clears `NEEDS_FRAME_WORK` if neither this object nor its children have frame work left.
+    /// Meant to be called after running frame scripts on this object's children.
+    #[no_dynamic]
+    fn try_clear_frame_work(self) {
+        let base = self.base();
+        if !base.needs_frame_work() || !self.frame_work_settled() {
+            return;
+        }
+        if let Some(container) = self.as_container()
+            && container
+                .iter_render_list()
+                .any(|child| child.base().needs_frame_work())
+        {
+            return;
+        }
+        base.set_flag(DisplayObjectFlags::NEEDS_FRAME_WORK, false);
+    }
+
     /// To be called when an AVM2 display object has finished being constructed.
     ///
     /// This function must be called once and ONLY once, after the object's
@@ -2453,9 +2512,13 @@ pub trait TDisplayObject<'gc>:
     fn run_frame_scripts(self, context: &mut UpdateContext<'gc>) {
         if let Some(container) = self.as_container() {
             for child in container.iter_render_list() {
+                if crate::frame_lifecycle::skips_frame_work(child) {
+                    continue;
+                }
                 child.run_frame_scripts(context);
             }
         }
+        self.try_clear_frame_work();
     }
 
     /// Called before the child is about to be rendered.
@@ -2977,6 +3040,20 @@ impl<'gc> DisplayObject<'gc> {
     }
 }
 
+thread_local! {
+    static ORPHAN_WORK_EPOCH: Cell<u64> = const { Cell::new(0) };
+}
+
+/// A counter that changes whenever an object that may be an orphan gets `NEEDS_FRAME_WORK`.
+/// While it doesn't change, orphans that were all settled stay settled.
+pub fn orphan_work_epoch() -> u64 {
+    ORPHAN_WORK_EPOCH.get()
+}
+
+pub(crate) fn bump_orphan_work_epoch() {
+    ORPHAN_WORK_EPOCH.set(ORPHAN_WORK_EPOCH.get().wrapping_add(1));
+}
+
 bitflags! {
     /// Bit flags used by `DisplayObject`.
     #[derive(Clone, Copy)]
@@ -3053,6 +3130,15 @@ bitflags! {
         /// (they need to be instantiated "manually" by
         /// `Sprite.constructChildren`).
         const MANUAL_FRAME_CONSTRUCT  = 1 << 16;
+
+        /// Whether frame construction or frame scripts may have something to do for this
+        /// object or its descendants. Set for new objects, and whenever state that affects
+        /// those phases changes; cleared once a frame scripts visit finds everything settled.
+        /// If set, it's also set on all ancestors.
+        ///
+        /// Gotos run frame phases for the entire stage and all orphans; this lets them
+        /// skip the (usually vast) parts where they would do nothing.
+        const NEEDS_FRAME_WORK         = 1 << 17;
     }
 }
 

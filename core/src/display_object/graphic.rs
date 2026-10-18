@@ -198,6 +198,11 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
         }
     }
 
+    fn frame_work_settled(self) -> bool {
+        // `construct_frame` only allocates the AVM2 object.
+        self.object2().is_some() || !self.movie().is_action_script_3()
+    }
+
     fn construct_frame(self, context: &mut UpdateContext<'gc>) {
         if self.movie().is_action_script_3() && self.object2().is_none() {
             let class_object = self

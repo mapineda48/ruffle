@@ -862,6 +862,9 @@ impl<'gc> TDisplayObject<'gc> for Stage<'gc> {
 
     fn construct_frame(self, context: &mut UpdateContext<'gc>) {
         for child in self.iter_render_list() {
+            if crate::frame_lifecycle::skips_frame_work(child) {
+                continue;
+            }
             child.construct_frame(context);
         }
     }

@@ -1,7 +1,9 @@
 //! Special handling for AVM2 orphan objects
 
 use crate::context::UpdateContext;
-use crate::display_object::{DisplayObject, DisplayObjectWeak, TDisplayObject};
+use crate::display_object::{
+    DisplayObject, DisplayObjectWeak, TDisplayObject, bump_orphan_work_epoch, orphan_work_epoch,
+};
 use gc_arena::{Collect, Mutation};
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -24,6 +26,10 @@ pub struct OrphanManager<'gc> {
     /// GcWeak keeps its allocation alive, so an address can't be reused while it's in the list.
     #[collect(require_static)]
     orphan_ptrs: HashSet<usize>,
+
+    /// The `orphan_work_epoch` at which every orphan was found settled, if it still is.
+    #[collect(require_static)]
+    settled_at_epoch: Option<u64>,
 }
 
 impl<'gc> OrphanManager<'gc> {
@@ -42,6 +48,19 @@ impl<'gc> OrphanManager<'gc> {
         if self.orphan_ptrs.insert(dobj.as_ptr() as usize) {
             self.orphans_mut().push(dobj.downgrade());
         }
+        if dobj.base().needs_frame_work() {
+            bump_orphan_work_epoch();
+        }
+    }
+
+    /// Whether every orphan was settled (without `NEEDS_FRAME_WORK`), and still is.
+    pub fn all_settled(&self) -> bool {
+        self.settled_at_epoch == Some(orphan_work_epoch())
+    }
+
+    /// Records that every orphan was settled at `epoch`.
+    pub fn set_all_settled(&mut self, epoch: u64) {
+        self.settled_at_epoch = Some(epoch);
     }
 
     pub fn each_orphan_obj(
@@ -105,6 +124,7 @@ impl<'gc> Default for OrphanManager<'gc> {
         Self {
             orphans: Rc::new(Vec::new()),
             orphan_ptrs: HashSet::new(),
+            settled_at_epoch: None,
         }
     }
 }
