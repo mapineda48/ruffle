@@ -61,6 +61,7 @@ use crate::vminterface::Instantiator;
 use async_channel::Sender;
 use enumset::EnumSet;
 use fnv::FnvHashSet;
+use gc_arena::arena::CollectionPhase;
 use gc_arena::lock::GcRefLock;
 use gc_arena::{Collect, DynamicRootSet, Mutation, Rootable};
 use ruffle_common::duration::FloatDuration;
@@ -611,6 +612,25 @@ impl Player {
             StreamManager::tick(context, dt);
         });
         self.audio.tick();
+    }
+
+    /// Spends up to `budget` on incremental garbage collection, ahead of the allocation debt.
+    ///
+    /// Meant for the time between frames: finishing collection cycles sooner frees unreachable
+    /// objects sooner, which matters for orphaned clips, as they keep running (and every goto
+    /// runs frame phases for them) until they're collected.
+    pub fn idle_gc(&mut self, budget: Duration) {
+        /// Units of collector work per step; one object costs about half a unit to trace.
+        const STEP: f64 = 1024.0;
+
+        let start = Instant::now();
+        let mut arena = self.gc_arena.borrow_mut();
+        // Only speed up a cycle that's running: starting cycles early would keep the
+        // collector running all the time.
+        while arena.collection_phase() != CollectionPhase::Sleeping && start.elapsed() < budget {
+            arena.metrics().adjust_debt(STEP);
+            arena.collect_debt();
+        }
     }
 
     pub fn time_til_next_timer(&self) -> Option<f64> {

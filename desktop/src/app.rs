@@ -14,14 +14,23 @@ use ruffle_core::events::{ImeEvent, ImeNotification, PlayerNotification};
 use ruffle_core::swf::HeaderExt;
 use ruffle_frontend_utils::content::ContentDescriptor;
 use ruffle_render::backend::ViewportDimensions;
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize, Size};
 use winit::event::{ElementState, Ime, KeyEvent, Modifiers, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Fullscreen, Icon, WindowAttributes, WindowId};
+
+/// Idle garbage collection only runs when the next frame is at least this far away.
+const IDLE_GC_MIN_SLACK: Duration = Duration::from_millis(4);
+
+const IDLE_GC_MAX_BUDGET: Duration = Duration::from_millis(8);
+
+/// Idle garbage collection can be disabled with `RUFFLE_IDLE_GC=0`, to compare.
+static IDLE_GC: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("RUFFLE_IDLE_GC").is_none_or(|v| v != "0"));
 
 struct MainWindow {
     preferences: GlobalPreferences,
@@ -429,7 +438,15 @@ impl MainWindow {
                 self.time = new_time;
                 self.next_frame_time = self.player.get().map(|mut player| {
                     player.tick(dt);
-                    new_time + player.time_til_next_frame()
+                    let next_frame_time = new_time + player.time_til_next_frame();
+
+                    // Use part of the wait for the next frame to collect garbage.
+                    let slack = next_frame_time.saturating_duration_since(Instant::now());
+                    if *IDLE_GC && slack > IDLE_GC_MIN_SLACK {
+                        player.idle_gc((slack / 2).min(IDLE_GC_MAX_BUDGET));
+                    }
+
+                    next_frame_time
                 });
                 self.check_redraw();
             }
