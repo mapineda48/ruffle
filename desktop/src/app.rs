@@ -35,6 +35,9 @@ struct MainWindow {
     /// Whether the player hasn't been told about the latest `mouse_pos` yet.
     /// See `flush_mouse_move`.
     mouse_move_pending: bool,
+    /// Whether the movie view lost its contents (e.g. it was resized), so the movie
+    /// must be rendered even if the player has nothing new to show.
+    movie_view_stale: bool,
     modifiers: Modifiers,
     min_window_size: LogicalSize<u32>,
     max_window_size: PhysicalSize<u32>,
@@ -61,8 +64,16 @@ impl MainWindow {
             // refuses to reconfigure it to a zero size.
             if !self.minimized && !self.occluded {
                 let mut player = self.player.get();
-                if let Some(ref mut player) = player {
+                if let Some(ref mut player) = player
+                    // Redraws are also requested for the GUI alone (e.g. egui reacting to
+                    // every mouse movement); then the movie view still shows the latest frame.
+                    // Like in Flash, changes made by mouse handlers show up with the next
+                    // frame, unless they call `updateAfterEvent()`.
                     // Even if the movie is paused, user interaction with debug tools can change the render output
+                    && (player.needs_render()
+                        || !player.is_playing()
+                        || std::mem::take(&mut self.movie_view_stale))
+                {
                     player.render();
                 }
 
@@ -89,6 +100,7 @@ impl MainWindow {
                 // new: macOS reports minimized windows as occluded instead, and
                 // on Wayland it always returns `None`.)
                 self.minimized = size.width == 0 && size.height == 0;
+                self.movie_view_stale = true;
 
                 if let Some(mut player) = self.player.get() {
                     let viewport_scale_factor = self.gui.window().scale_factor();
@@ -584,6 +596,7 @@ impl ApplicationHandler<RuffleEvent> for App {
                 occluded: false,
                 mouse_pos: PhysicalPosition::new(0.0, 0.0),
                 mouse_move_pending: false,
+                movie_view_stale: true,
                 modifiers: Modifiers::default(),
                 time: Instant::now(),
                 next_frame_time: None,
