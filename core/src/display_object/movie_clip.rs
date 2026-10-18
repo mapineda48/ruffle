@@ -393,7 +393,7 @@ impl<'gc> MovieClip<'gc> {
         ));
         write.tag_stream_pos.set(0);
         write.flags.set(MovieClipFlags::PLAYING);
-        write.current_frame.set(0);
+        write.set_current_frame(0);
         write.audio_stream.take();
     }
 
@@ -817,7 +817,9 @@ impl<'gc> MovieClip<'gc> {
     }
 
     pub fn set_has_pending_script(self, value: bool) {
-        self.0.has_pending_script.set(value);
+        if self.0.has_pending_script.replace(value) != value {
+            self.0.mark_frame_work();
+        }
     }
 
     pub fn last_queued_script_frame(self) -> Option<FrameNumber> {
@@ -825,7 +827,9 @@ impl<'gc> MovieClip<'gc> {
     }
 
     pub fn set_last_queued_script_frame(self, frame: Option<FrameNumber>) {
-        self.0.last_queued_script_frame.set(frame);
+        if self.0.last_queued_script_frame.replace(frame) != frame {
+            self.0.mark_frame_work();
+        }
     }
 
     pub fn set_programmatically_played(self) {
@@ -913,6 +917,7 @@ impl<'gc> MovieClip<'gc> {
                 // the current frame, the goto is properly queued.
 
                 self.0.queued_goto.set(Some(goto_info));
+                self.0.mark_frame_work();
 
                 // If we have a frame script on that frame, add ourselves to the
                 // frame script cleanup queue so that that frame script is
@@ -1147,7 +1152,7 @@ impl<'gc> MovieClip<'gc> {
 
     /// This sets the current frame of this MovieClip to a given number.
     pub fn set_current_frame(self, current_frame: FrameNumber) {
-        self.0.current_frame.set(current_frame);
+        self.0.set_current_frame(current_frame);
     }
 
     /// The amount of frames loaded in this movieclip.
@@ -1487,7 +1492,10 @@ impl<'gc> MovieClip<'gc> {
             self.0.increment_current_frame();
         }
 
-        self.0.queued_script_frame.set(self.0.current_frame.get());
+        let queued_script_frame = self.0.current_frame.get();
+        if self.0.queued_script_frame.replace(queued_script_frame) != queued_script_frame {
+            self.0.mark_frame_work();
+        }
         if self.last_queued_script_frame() != Some(self.0.current_frame.get()) {
             // We explicitly clear this variable since AS3 may later GOTO back
             // to the already-ran frame. Since the frame number *has* changed
@@ -1680,7 +1688,7 @@ impl<'gc> MovieClip<'gc> {
             // when rewinding. We don't actually remove children yet because
             // otherwise AS3 can observe byproducts of the rewinding process.
             self.0.tag_stream_pos.set(0);
-            self.0.current_frame.set(0);
+            self.0.set_current_frame(0);
 
             true
         } else {
@@ -1884,7 +1892,7 @@ impl<'gc> MovieClip<'gc> {
                 self.movie().is_action_script_3(),
             );
         } else {
-            self.0.current_frame.set(clamped_frame);
+            self.0.set_current_frame(clamped_frame);
         }
 
         // Finally, run frames for children that are placed on this frame.
@@ -2169,6 +2177,7 @@ impl<'gc> MovieClip<'gc> {
         } else if frame_scripts.len() > index {
             frame_scripts[index] = None;
         }
+        self.0.mark_frame_work();
     }
 
     /// Handle a RemoveObject tag when running a goto action.
@@ -2202,7 +2211,7 @@ impl<'gc> MovieClip<'gc> {
             //
             // We also have to reset the frame number as this emits AS3 events.
             let to_frame = self.current_frame();
-            self.0.current_frame.set(from_frame);
+            self.0.set_current_frame(from_frame);
 
             let child = self.child_by_depth(depth);
             if let Some(child) = child {
@@ -2215,7 +2224,7 @@ impl<'gc> MovieClip<'gc> {
                 removed_frame_scripts.push(child);
             }
 
-            self.0.current_frame.set(to_frame);
+            self.0.set_current_frame(to_frame);
         }
         Ok(())
     }
@@ -2466,6 +2475,7 @@ impl<'gc> MovieClip<'gc> {
                     self.set_has_pending_script(false);
                     self.0
                         .set_flag(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT, true);
+                    self.0.mark_frame_work();
 
                     let movie = self.movie();
                     let domain = context
@@ -2614,6 +2624,10 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
                     .0
                     .contains_flag(MovieClipFlags::RUNNING_CONSTRUCT_FRAME);
                 for child in self.iter_render_list() {
+                    if crate::frame_lifecycle::skips_frame_work(child) {
+                        continue;
+                    }
+
                     // Under some conditions, we won't run `construct_frame` on
                     // a not-yet-constructed child
                     if child.object2().is_none() {
@@ -2651,8 +2665,37 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
         self.run_local_frame_scripts(context);
 
         for child in self.iter_render_list() {
+            if crate::frame_lifecycle::skips_frame_work(child) {
+                continue;
+            }
             child.run_frame_scripts(context);
         }
+        self.try_clear_frame_work();
+    }
+
+    fn frame_work_settled(self) -> bool {
+        let data = &self.0;
+        if !self.movie().is_action_script_3() {
+            // Frame phases only do things for AVM2 clips.
+            return true;
+        }
+        // Something `construct_frame` would do.
+        if !(self.frames_loaded() >= 1 || self.header_frames() == 0)
+            || data.object2.get().is_none()
+            || !data.initialized()
+            || data.contains_flag(MovieClipFlags::LOOP_QUEUED)
+            || data.contains_flag(MovieClipFlags::RUNNING_CONSTRUCT_FRAME)
+            || data.contains_flag(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT)
+            || data.has_pending_script.get() != self.has_frame_script(data.current_frame.get())
+        {
+            return false;
+        }
+        // Something `run_local_frame_scripts` would do.
+        let frame = data.queued_script_frame.get();
+        let runs_frame_script = data.has_pending_script.get()
+            && data.last_queued_script_frame.get() != Some(frame)
+            && self.has_frame_script(frame);
+        !runs_frame_script && data.queued_goto.get().is_none()
     }
 
     fn render_self(self, context: &mut RenderContext<'_, 'gc>) {
@@ -3336,14 +3379,23 @@ impl<'gc> MovieClipData<'gc> {
         self.current_frame.get()
     }
 
+    fn set_current_frame(&self, frame: FrameNumber) {
+        if self.current_frame.replace(frame) != frame {
+            self.mark_frame_work();
+        }
+    }
+
     fn increment_current_frame(&self) {
-        let frame = self.current_frame.get();
-        self.current_frame.set(frame + 1);
+        self.set_current_frame(self.current_frame.get() + 1);
     }
 
     fn decrement_current_frame(&self) {
-        let frame = self.current_frame.get();
-        self.current_frame.set(frame - 1);
+        self.set_current_frame(self.current_frame.get() - 1);
+    }
+
+    /// See `DisplayObjectFlags::NEEDS_FRAME_WORK`.
+    fn mark_frame_work(&self) {
+        self.base.base.mark_frame_work();
     }
 
     fn header_frames(&self) -> FrameNumber {
@@ -3376,6 +3428,7 @@ impl<'gc> MovieClipData<'gc> {
 
     fn set_loop_queued(&self) {
         self.set_flag(MovieClipFlags::LOOP_QUEUED, true);
+        self.mark_frame_work();
     }
 
     fn unset_loop_queued(&self) {
@@ -4631,6 +4684,9 @@ impl<'gc, 'a> MovieClip<'gc> {
     pub fn set_constructing_frame(self, val: bool) {
         self.0
             .set_flag(MovieClipFlags::RUNNING_CONSTRUCT_FRAME, val);
+        if val {
+            self.0.mark_frame_work();
+        }
     }
 }
 

@@ -260,6 +260,20 @@ impl<'gc> MovieLibrary<'gc> {
         character: Character<'gc>,
         mc: &Mutation<'gc>,
     ) -> Option<DisplayObject<'gc>> {
+        let object = self.instantiate_display_object_inner(id, character, mc);
+        // Instances copy their prototype's flags.
+        if let Some(object) = object {
+            object.base().mark_frame_work();
+        }
+        object
+    }
+
+    fn instantiate_display_object_inner(
+        &self,
+        id: CharacterId,
+        character: Character<'gc>,
+        mc: &Mutation<'gc>,
+    ) -> Option<DisplayObject<'gc>> {
         match character {
             Character::Bitmap(bitmap) => {
                 let avm2_class = bitmap.avm2_class();

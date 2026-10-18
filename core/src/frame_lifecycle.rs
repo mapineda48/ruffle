@@ -11,12 +11,105 @@
 //! runs in one phase, with timeline operations executing with all phases
 //! inline in the order that clips were originally created.
 
+use crate::avm2::object::TObject as _;
 use crate::avm2::{Avm2, EventObject};
 use crate::context::UpdateContext;
-use crate::display_object::{DisplayObject, MovieClip, TDisplayObject};
+use crate::display_object::{
+    DisplayObject, MovieClip, TDisplayObject, TDisplayObjectContainer, orphan_work_epoch,
+};
 use crate::loader::LoadManager;
 use crate::orphan_manager::OrphanManager;
+use std::cell::Cell;
+use std::sync::LazyLock;
 use tracing::instrument;
+
+thread_local! {
+    /// Whether the frame phases being run skip objects without `NEEDS_FRAME_WORK`.
+    static SKIP_SETTLED: Cell<bool> = const { Cell::new(false) };
+
+    /// How many subtrees were skipped, to pick which ones to verify.
+    static SKIPPED: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Gotos skip settled objects unless `RUFFLE_GOTO_FULL_PASS=1` is set, to compare.
+static GOTO_SKIPS_SETTLED: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("RUFFLE_GOTO_FULL_PASS").is_none_or(|v| v != "1"));
+
+/// `RUFFLE_GOTO_VERIFY=1` checks every skipped subtree; otherwise only a sample is checked.
+static GOTO_VERIFY_ALL: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("RUFFLE_GOTO_VERIFY").is_some_and(|v| v == "1"));
+
+const GOTO_VERIFY_SAMPLE: u64 = 64;
+
+/// Whether the frame phases being run can skip `child` (and its descendants), because
+/// they would do nothing there.
+#[inline]
+pub fn skips_frame_work(child: DisplayObject<'_>) -> bool {
+    if !SKIP_SETTLED.get() || child.base().needs_frame_work() {
+        return false;
+    }
+    let skipped = SKIPPED.replace(SKIPPED.get().wrapping_add(1));
+    if (*GOTO_VERIFY_ALL || skipped.is_multiple_of(GOTO_VERIFY_SAMPLE))
+        && let Some(unsettled) = find_unsettled(child)
+    {
+        // A state change that creates frame work isn't marking `NEEDS_FRAME_WORK`.
+        tracing::warn!(
+            "Skipped frame work of {:?} (in {:?}), which isn't settled",
+            unsettled
+                .object2()
+                .map(|o| crate::avm2::Object::from(o).instance_class().name()),
+            child
+                .object2()
+                .map(|o| crate::avm2::Object::from(o).instance_class().name()),
+        );
+        unsettled.base().mark_frame_work();
+        return false;
+    }
+    true
+}
+
+/// Whether the frame phases being run can skip the orphan list, as no orphan has frame work.
+fn skips_settled_orphans(context: &mut UpdateContext<'_>) -> bool {
+    if !SKIP_SETTLED.get() || !context.orphan_manager.all_settled() {
+        return false;
+    }
+    if *GOTO_VERIFY_ALL {
+        let mut unsettled = None;
+        OrphanManager::each_orphan_obj(context, |orphan, _| {
+            unsettled = unsettled.or_else(|| find_unsettled(orphan));
+        });
+        if let Some(unsettled) = unsettled {
+            tracing::warn!(
+                "Skipped the orphan list, but {:?} isn't settled",
+                unsettled
+                    .object2()
+                    .map(|o| crate::avm2::Object::from(o).instance_class().name()),
+            );
+            return false;
+        }
+    }
+    true
+}
+
+/// Finds an object in this subtree that has frame work left, despite having none
+/// according to `NEEDS_FRAME_WORK`.
+fn find_unsettled(object: DisplayObject<'_>) -> Option<DisplayObject<'_>> {
+    if object.base().needs_frame_work() || !object.frame_work_settled() {
+        return Some(object);
+    }
+    object
+        .as_container()?
+        .iter_render_list()
+        .find_map(find_unsettled)
+}
+
+/// Runs `f` with skipping of settled objects enabled or disabled.
+fn with_skip_settled<R>(skip: bool, f: impl FnOnce() -> R) -> R {
+    let old = SKIP_SETTLED.replace(skip);
+    let result = f();
+    SKIP_SETTLED.set(old);
+    result
+}
 
 /// Which phase of the frame we're currently in.
 ///
@@ -71,6 +164,11 @@ pub enum FramePhase {
 /// output exactly for two complex test cases (see `avm2/orphan_movie*`)
 #[instrument(level = "debug", skip_all)]
 pub fn run_all_phases_avm2(context: &mut UpdateContext<'_>) {
+    // Regular frames visit everything, which also clears `NEEDS_FRAME_WORK` where possible.
+    with_skip_settled(false, || run_all_phases_avm2_inner(context));
+}
+
+fn run_all_phases_avm2_inner(context: &mut UpdateContext<'_>) {
     let stage = context.stage;
 
     if !stage.movie().is_action_script_3() {
@@ -134,6 +232,15 @@ pub fn run_inner_goto_frame<'gc>(
         return;
     }
 
+    with_skip_settled(*GOTO_SKIPS_SETTLED, || {
+        run_inner_goto_frame_phases(context, removed_frame_scripts)
+    });
+}
+
+fn run_inner_goto_frame_phases<'gc>(
+    context: &mut UpdateContext<'gc>,
+    removed_frame_scripts: &[DisplayObject<'gc>],
+) {
     let stage = context.stage;
     let old_phase = *context.frame_phase;
 
@@ -143,18 +250,35 @@ pub fn run_inner_goto_frame<'gc>(
 
     // Note - we do *not* call `enter_frame` or dispatch an `enterFrame` event
 
+    // Most of the time no orphan has frame work; then don't even walk their list.
+    let skip_orphans = skips_settled_orphans(context);
+
     *context.frame_phase = FramePhase::Construct;
-    OrphanManager::each_orphan_obj(context, |orphan, context| {
-        orphan.construct_frame(context);
-    });
+    if !skip_orphans {
+        OrphanManager::each_orphan_obj(context, |orphan, context| {
+            if !skips_frame_work(orphan) {
+                orphan.construct_frame(context);
+            }
+        });
+    }
     stage.construct_frame(context);
     broadcast_frame_constructed(context);
 
     *context.frame_phase = FramePhase::FrameScripts;
     stage.run_frame_scripts(context);
-    OrphanManager::each_orphan_obj(context, |orphan, context| {
-        orphan.run_frame_scripts(context);
-    });
+    if !skip_orphans {
+        let epoch = orphan_work_epoch();
+        let mut all_settled = true;
+        OrphanManager::each_orphan_obj(context, |orphan, context| {
+            if !skips_frame_work(orphan) {
+                orphan.run_frame_scripts(context);
+            }
+            all_settled &= !orphan.base().needs_frame_work();
+        });
+        if SKIP_SETTLED.get() && all_settled && orphan_work_epoch() == epoch {
+            context.orphan_manager.set_all_settled(epoch);
+        }
+    }
 
     for child in removed_frame_scripts {
         child.run_frame_scripts(context);

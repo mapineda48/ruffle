@@ -443,6 +443,12 @@ impl<'gc> TDisplayObject<'gc> for Avm2Button<'gc> {
         }
     }
 
+    fn frame_work_settled(self) -> bool {
+        // States that aren't current have no parent, so their `NEEDS_FRAME_WORK`
+        // doesn't reach us; always visit buttons to be safe.
+        false
+    }
+
     fn construct_frame(self, context: &mut UpdateContext<'gc>) {
         for state in self.all_state_children(false) {
             state.construct_frame(context);
