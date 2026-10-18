@@ -2,6 +2,7 @@ use crate::custom_event::{OpenType, RuffleEvent};
 use crate::gui::{GuiController, MENU_HEIGHT};
 use crate::player::{LaunchOptions, PlayerController};
 use crate::preferences::GlobalPreferences;
+use crate::telemetry::{self, Phase};
 use crate::util::{
     get_screen_size, gilrs_button_to_gamepad_button, winit_input_to_ruffle_key_descriptor,
     winit_to_ruffle_text_control,
@@ -83,9 +84,11 @@ impl MainWindow {
                         || !player.is_playing()
                         || std::mem::take(&mut self.movie_view_stale))
                 {
+                    let _scope = telemetry::scope(Phase::Render);
                     player.render();
                 }
 
+                let _scope = telemetry::scope(Phase::Gui);
                 self.gui.render(player);
             }
 
@@ -437,12 +440,17 @@ impl MainWindow {
             if dt.as_millis() > 0.0 {
                 self.time = new_time;
                 self.next_frame_time = self.player.get().map(|mut player| {
-                    player.tick(dt);
+                    {
+                        let _scope = telemetry::scope(Phase::Tick);
+                        player.tick(dt);
+                    }
+                    telemetry::record_tick(&mut player);
                     let next_frame_time = new_time + player.time_til_next_frame();
 
                     // Use part of the wait for the next frame to collect garbage.
                     let slack = next_frame_time.saturating_duration_since(Instant::now());
                     if *IDLE_GC && slack > IDLE_GC_MIN_SLACK {
+                        let _scope = telemetry::scope(Phase::IdleGc);
                         player.idle_gc((slack / 2).min(IDLE_GC_MAX_BUDGET));
                     }
 
@@ -510,6 +518,7 @@ impl App {
 impl ApplicationHandler<RuffleEvent> for App {
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
         enter_runtime!(self);
+        let _scope = telemetry::scope(Phase::NewEvents);
 
         if cause == StartCause::Init {
             let movie_url = self.preferences.cli.movie_url.clone();
@@ -626,6 +635,11 @@ impl ApplicationHandler<RuffleEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: RuffleEvent) {
         enter_runtime!(self);
+        let _scope = telemetry::scope(if matches!(event, RuffleEvent::TaskPoll(_)) {
+            Phase::Task
+        } else {
+            Phase::UserEvent
+        });
 
         match (&mut self.main_window, event) {
             (Some(main_window), RuffleEvent::TaskPoll(task)) => main_window.player.poll(task),
@@ -739,6 +753,11 @@ impl ApplicationHandler<RuffleEvent> for App {
         event: WindowEvent,
     ) {
         enter_runtime!(self);
+        let _scope = telemetry::scope(if matches!(event, WindowEvent::RedrawRequested) {
+            Phase::Redraw
+        } else {
+            Phase::WindowEvent
+        });
 
         if let Some(main_window) = &mut self.main_window {
             main_window.window_event(event_loop, event);
@@ -747,6 +766,7 @@ impl ApplicationHandler<RuffleEvent> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         enter_runtime!(self);
+        let _scope = telemetry::scope(Phase::AboutToWait);
 
         if let Some(main_window) = &mut self.main_window {
             main_window.about_to_wait(self.gilrs.as_mut());

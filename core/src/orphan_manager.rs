@@ -1,11 +1,14 @@
 //! Special handling for AVM2 orphan objects
 
+use crate::avm2::object::TObject;
 use crate::context::UpdateContext;
 use crate::display_object::{
-    DisplayObject, DisplayObjectWeak, TDisplayObject, bump_orphan_work_epoch, orphan_work_epoch,
+    DisplayObject, DisplayObjectWeak, TDisplayObject, TDisplayObjectContainer,
+    bump_orphan_work_epoch, orphan_work_epoch,
 };
+use crate::telemetry::DisplayCensus;
 use gc_arena::{Collect, Mutation};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 /// The list of 'orphan' objects - these objects have no parent,
@@ -117,6 +120,42 @@ impl<'gc> OrphanManager<'gc> {
             keep
         });
     }
+
+    /// Counts the orphans and their descendants, and optionally the classes of the orphans.
+    pub fn census(&self, mc: &Mutation<'gc>, census: &mut DisplayCensus, with_classes: bool) {
+        census.orphan_entries = self.orphans.len();
+        let mut classes: HashMap<String, usize> = HashMap::new();
+        for orphan in self.orphans.iter() {
+            let Some(dobj) = valid_orphan(*orphan, mc) else {
+                continue;
+            };
+            census.live_orphans += 1;
+            census.orphan_objects += count_objects(dobj);
+            if with_classes {
+                let class = dobj.object2().map_or_else(
+                    || "(no AVM2 object)".to_string(),
+                    |obj| {
+                        crate::avm2::Object::from(obj)
+                            .instance_class()
+                            .name()
+                            .to_qualified_name(mc)
+                            .to_string()
+                    },
+                );
+                *classes.entry(class).or_default() += 1;
+            }
+        }
+        let mut classes: Vec<_> = classes.into_iter().collect();
+        classes.sort_by(|a, b| b.1.cmp(&a.1));
+        census.orphan_classes = classes;
+    }
+}
+
+/// Counts `dobj` and all its descendants.
+pub fn count_objects(dobj: DisplayObject<'_>) -> usize {
+    1 + dobj.as_container().map_or(0, |container| {
+        container.iter_render_list().map(count_objects).sum()
+    })
 }
 
 impl<'gc> Default for OrphanManager<'gc> {

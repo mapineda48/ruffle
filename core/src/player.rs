@@ -56,6 +56,7 @@ use crate::string::{AvmString, AvmStringInterner, StringContext};
 use crate::stub::StubCollection;
 use crate::system_properties::SystemProperties;
 use crate::tag_utils::SwfMovie;
+use crate::telemetry::{DisplayCensus, TickStats};
 use crate::timer::Timers;
 use crate::vminterface::Instantiator;
 use async_channel::Sender;
@@ -365,6 +366,9 @@ pub struct Player {
     frame_accumulator: FloatDuration,
     recent_run_frame_timings: VecDeque<f64>,
 
+    /// How long each part of the last `tick` took.
+    last_tick_stats: TickStats,
+
     /// Faked time passage for fooling hand-written busy-loop FPS limiters.
     time_offset: u32,
 
@@ -548,6 +552,7 @@ impl Player {
 
     pub fn tick(&mut self, dt: FloatDuration) {
         if !self.is_playing() {
+            self.last_tick_stats = TickStats::default();
             return;
         }
 
@@ -556,11 +561,14 @@ impl Player {
 
         let max_frames_per_tick = self.max_frames_per_tick();
         let mut frame = 0;
+        let mut stats = TickStats::default();
 
         while frame < max_frames_per_tick && self.frame_accumulator >= frame_duration {
             let timer = Instant::now();
             self.run_frame();
-            let elapsed = timer.elapsed().as_millis() as f64;
+            let elapsed = timer.elapsed();
+            stats.run_frame += elapsed;
+            let elapsed = elapsed.as_millis() as f64;
 
             self.add_frame_timing(elapsed);
 
@@ -605,13 +613,40 @@ impl Player {
         });
         self.frame_accumulator += FloatDuration::from_secs(audio_skew);
 
+        let timer = Instant::now();
         self.update_sockets();
+        stats.sockets = timer.elapsed();
+
+        let timer = Instant::now();
         self.update_net_connections();
+        stats.net_connections = timer.elapsed();
+
+        let timer = Instant::now();
         self.update_timers(dt);
+        stats.timers = timer.elapsed();
+
+        let timer = Instant::now();
         self.update(|context| {
             StreamManager::tick(context, dt);
         });
+        stats.streams = timer.elapsed();
+
+        let timer = Instant::now();
         self.audio.tick();
+        stats.audio = timer.elapsed();
+
+        stats.frames = frame;
+        self.last_tick_stats = stats;
+    }
+
+    /// How long each part of the last `tick` took.
+    pub fn last_tick_stats(&self) -> TickStats {
+        self.last_tick_stats
+    }
+
+    /// The number of live objects in the garbage-collected heap.
+    pub fn gc_object_count(&self) -> usize {
+        self.gc_arena.borrow().metrics().total_gc_count()
     }
 
     /// Spends up to `budget` on incremental garbage collection, ahead of the allocation debt.
@@ -631,6 +666,20 @@ impl Player {
             arena.metrics().adjust_debt(STEP);
             arena.collect_debt();
         }
+    }
+
+    /// Counts the objects on the display list and in the orphan list.
+    pub fn display_census(&mut self, with_classes: bool) -> DisplayCensus {
+        self.mutate_with_update_context(|context| {
+            let mut census = DisplayCensus {
+                stage_objects: crate::orphan_manager::count_objects(context.stage.into()),
+                ..Default::default()
+            };
+            context
+                .orphan_manager
+                .census(context.gc(), &mut census, with_classes);
+            census
+        })
     }
 
     pub fn time_til_next_timer(&self) -> Option<f64> {
@@ -3105,6 +3154,7 @@ impl PlayerBuilder {
                 frame_phase: Default::default(),
                 frame_accumulator: FloatDuration::ZERO,
                 recent_run_frame_timings: VecDeque::with_capacity(10),
+                last_tick_stats: TickStats::default(),
                 start_time: Instant::now(),
                 time_offset: 0,
                 time_til_next_timer: None,

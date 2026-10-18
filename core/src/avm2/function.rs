@@ -303,9 +303,22 @@ pub fn exec<'gc>(
                 span
             };
 
+            // A request made before this call was made while running the caller.
+            if crate::telemetry::take_avm2_stack_request() {
+                let stack = activation.context.avm2.call_stack().borrow().to_string();
+                crate::telemetry::store_avm2_stack(stack);
+            }
+
             activation.context.avm2.push_call(mc, method);
 
             let result = native_method(&mut activation, receiver, args);
+
+            // A slow native method can't check for stack requests while it runs,
+            // so answer the ones made meanwhile before it leaves the call stack.
+            if crate::telemetry::take_avm2_stack_request() {
+                let stack = activation.context.avm2.call_stack().borrow().to_string();
+                crate::telemetry::store_avm2_stack(stack);
+            }
 
             activation.cleanup();
 

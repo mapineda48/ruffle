@@ -15,6 +15,7 @@ mod gui;
 mod log;
 mod player;
 mod preferences;
+mod telemetry;
 #[cfg(feature = "tracy")]
 mod tracy;
 mod util;
@@ -194,6 +195,8 @@ fn main() -> Result<(), Error> {
     };
 
     subscriber.init();
+
+    telemetry::init(&preferences.cli.cache_directory);
 
     let result = App::new(preferences).and_then(|(mut app, event_loop)| {
         event_loop.run_app(&mut app).context("Event loop failure")

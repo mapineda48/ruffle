@@ -929,6 +929,10 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         *self.context.actions_since_timeout_check += 1;
         if *self.context.actions_since_timeout_check >= 10000 {
             *self.context.actions_since_timeout_check = 0;
+            if crate::telemetry::take_avm2_stack_request() {
+                let stack = self.context.avm2.call_stack().borrow().to_string();
+                crate::telemetry::store_avm2_stack(stack);
+            }
             if self.context.update_start.elapsed() >= self.context.max_execution_duration {
                 return Err(
                     "A script in this movie has taken too long to execute and has been terminated."
