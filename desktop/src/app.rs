@@ -32,6 +32,9 @@ struct MainWindow {
     /// (and on X11 only without a compositor). Always false elsewhere.
     occluded: bool,
     mouse_pos: PhysicalPosition<f64>,
+    /// Whether the player hasn't been told about the latest `mouse_pos` yet.
+    /// See `flush_mouse_move`.
+    mouse_move_pending: bool,
     modifiers: Modifiers,
     min_window_size: LogicalSize<u32>,
     max_window_size: PhysicalSize<u32>,
@@ -47,6 +50,11 @@ struct MainWindow {
 
 impl MainWindow {
     pub fn window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
+        if !matches!(event, WindowEvent::CursorMoved { .. }) {
+            // Keep the movement in order with the other events.
+            self.flush_mouse_move();
+        }
+
         if matches!(event, WindowEvent::RedrawRequested) {
             // Don't render when nobody can see the result: while minimized, the
             // surface also keeps the size it had before, as `GuiController::resize`
@@ -115,10 +123,7 @@ impl MainWindow {
                 }
 
                 self.mouse_pos = position;
-                let (x, y) = self.gui.window_to_movie_position(position);
-                let event = PlayerEvent::MouseMove { x, y };
-                self.player.handle_event(event);
-                self.check_redraw();
+                self.mouse_move_pending = true;
             }
             WindowEvent::DroppedFile(file) => {
                 if let Some(content_descriptor) = ContentDescriptor::new_local(&file, None) {
@@ -363,7 +368,25 @@ impl MainWindow {
         }
     }
 
+    /// Sends the player the latest mouse position, if it hasn't seen it yet.
+    ///
+    /// Mice can report movement 1000 times per second, and every `mouseMove` can run
+    /// ActionScript (often a hit test, or a goto that runs frame phases for the whole stage).
+    /// So the movements of one batch of events are coalesced into a single one, like
+    /// Windows does with `WM_MOUSEMOVE`. When the player falls behind, batches grow,
+    /// and it gets fewer events to process instead of more.
+    fn flush_mouse_move(&mut self) {
+        if !std::mem::take(&mut self.mouse_move_pending) {
+            return;
+        }
+        let (x, y) = self.gui.window_to_movie_position(self.mouse_pos);
+        self.player.handle_event(PlayerEvent::MouseMove { x, y });
+        self.check_redraw();
+    }
+
     fn about_to_wait(&mut self, gilrs: Option<&mut Gilrs>) {
+        self.flush_mouse_move();
+
         if let Some(Event { event, .. }) = gilrs.and_then(|gilrs| gilrs.next_event()) {
             match event {
                 EventType::ButtonPressed(button, _) => {
@@ -560,6 +583,7 @@ impl ApplicationHandler<RuffleEvent> for App {
                 minimized: false,
                 occluded: false,
                 mouse_pos: PhysicalPosition::new(0.0, 0.0),
+                mouse_move_pending: false,
                 modifiers: Modifiers::default(),
                 time: Instant::now(),
                 next_frame_time: None,
