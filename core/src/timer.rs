@@ -17,6 +17,8 @@ use crate::string::AvmString;
 use gc_arena::Collect;
 use ruffle_common::duration::FloatDuration;
 use std::collections::{BinaryHeap, binary_heap::PeekMut};
+use std::time::Duration;
+use web_time::Instant;
 
 /// Manages the collection of timers.
 #[derive(Collect)]
@@ -46,6 +48,7 @@ impl<'gc> Timers<'gc> {
 
         let level0 = context.stage.root_clip();
 
+        let start = Instant::now();
         let mut tick_count = 0;
 
         // We have to be careful because the timer list can be mutated while updating;
@@ -60,10 +63,11 @@ impl<'gc> Timers<'gc> {
             let timer = context.timers.peek().unwrap();
 
             tick_count += 1;
-            // SANITY: Only allow so many ticks per update.
-            if tick_count > Self::MAX_TICKS {
-                // Reset our time to a little bit before the nearest timer.
-                context.timers.cur_time = timer.tick_time.wrapping_sub(100);
+            // SANITY: Only allow so many ticks (and so much time) per update.
+            // The remaining timers run in the next update, without the ticks that intervals
+            // missed, so that slow callbacks can't snowball into longer and longer updates.
+            if tick_count > Self::MAX_TICKS || start.elapsed() >= Self::MAX_UPDATE_DURATION {
+                context.timers.resync_late_intervals();
                 break;
             }
 
@@ -183,6 +187,7 @@ impl<'gc> Timers<'gc> {
 
             // We need a mutable reference to the timer for the rest.
             // Just checked that there is still at least one timer active, so unwrap must succeed.
+            let cur_time = context.timers.cur_time;
             let mut timer = context.timers.peek_mut().unwrap();
 
             if timer.id == expected_id {
@@ -194,6 +199,14 @@ impl<'gc> Timers<'gc> {
                 } else {
                     // Reset setInterval timers. `peek_mut` re-sorts the timer in the priority queue.
                     timer.tick_time = timer.tick_time.wrapping_add(timer.interval);
+
+                    // Like Flash, drop the ticks an interval missed by falling far behind
+                    // (e.g. because its callbacks are slow) instead of firing them in a burst.
+                    // Otherwise slow callbacks make the next update later, which makes
+                    // it fire even more callbacks to catch up, and the player locks up.
+                    if timer.tick_time.wrapping_add(Self::MAX_LAG) < cur_time {
+                        timer.tick_time = cur_time;
+                    }
                 }
             } else {
                 drop(timer);
@@ -206,7 +219,9 @@ impl<'gc> Timers<'gc> {
 
         // Return estimated time until next timer tick.
         context.timers.peek().map(|timer| {
-            (timer.tick_time.wrapping_sub(context.timers.cur_time)) as f64 / Self::TIMER_SCALE
+            // Timers left over by `MAX_TICKS` are already due.
+            (timer.tick_time.wrapping_sub(context.timers.cur_time) as i64).max(0) as f64
+                / Self::TIMER_SCALE
         })
     }
 
@@ -215,6 +230,14 @@ impl<'gc> Timers<'gc> {
 
     /// The maximum timer ticks per call to `update_ticks`, for sanity.
     const MAX_TICKS: i32 = 10;
+
+    /// How long a call to `update_ticks` keeps running callbacks.
+    const MAX_UPDATE_DURATION: Duration = Duration::from_millis(50);
+
+    /// How far behind an interval timer may fall before its missed ticks are dropped
+    /// (in timer units). Small enough lags are caught up on, which lets intervals
+    /// shorter than a frame tick several times per frame.
+    const MAX_LAG: u64 = 100 * Self::TIMER_SCALE as u64;
 
     /// The scale of the timers (microseconds).
     const TIMER_SCALE: f64 = 1000.0;
@@ -276,6 +299,19 @@ impl<'gc> Timers<'gc> {
         // Sanity check: Either we removed a single timer, or none.
         debug_assert!(len == old_len || len == old_len - 1);
         len < old_len
+    }
+
+    /// Makes intervals that are due fire once in the next update, instead of once
+    /// for every tick they missed.
+    fn resync_late_intervals(&mut self) {
+        let cur_time = self.cur_time;
+        let mut timers = std::mem::take(&mut self.timers).into_vec();
+        for timer in &mut timers {
+            if !timer.is_timeout && timer.tick_time < cur_time {
+                timer.tick_time = cur_time;
+            }
+        }
+        self.timers = timers.into();
     }
 
     pub fn remove_all(&mut self) {
