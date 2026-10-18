@@ -41,11 +41,20 @@ impl DynamicMapKey for DynamicKey<'_> {
     // See https://github.com/adobe/avmplus/blob/858d034a3bd3a54d9b70909386435cf4aec81d21/core/avmplusHashtable.cpp
     fn identity_hash(&self) -> Option<u64> {
         match self {
-            DynamicKey::Uint(index) => Some(u64::from(*index)),
+            DynamicKey::Uint(index) => {
+                let index = u64::from(*index);
+                // Only the tag bits get mixed, so the bucket is still the value itself.
+                let tag = index.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 57;
+                Some(index ^ (tag << TAG_SHIFT))
+            }
             _ => None,
         }
     }
 }
+
+/// hashbrown uses the top 7 bits of a hash (as a `usize`) as a tag to filter
+/// candidate buckets, and the low bits to pick the bucket.
+const TAG_SHIFT: u32 = usize::BITS - 7;
 
 impl DynamicMapKey for &'static str {}
 
@@ -75,7 +84,13 @@ impl<K: DynamicMapKey, V> Default for DynamicMap<K, V> {
 
 impl<K: DynamicMapKey, V> DynamicMap<K, V> {
     fn hash_with(hasher: &FnvBuildHasher, key: &K) -> u64 {
-        key.identity_hash().unwrap_or_else(|| hasher.hash_one(key))
+        key.identity_hash().unwrap_or_else(|| {
+            // The last bytes FNV-1a mixes in never reach the top bits, so keys that only
+            // differ at their end (`item1`, `item2`...) would all get the same tag.
+            // Folding the low bits into the tag leaves the bucket (and so enumeration order) as is.
+            let hash = hasher.hash_one(key);
+            hash ^ (hash << TAG_SHIFT)
+        })
     }
 
     fn hash_key(&self, key: &K) -> u64 {
