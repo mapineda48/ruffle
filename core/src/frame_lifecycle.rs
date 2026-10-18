@@ -19,6 +19,7 @@ use crate::display_object::{
 };
 use crate::loader::LoadManager;
 use crate::orphan_manager::OrphanManager;
+use crate::telemetry::{self, GotoPart};
 use std::cell::Cell;
 use std::sync::LazyLock;
 use tracing::instrument;
@@ -26,9 +27,6 @@ use tracing::instrument;
 thread_local! {
     /// Whether the frame phases being run skip objects without `NEEDS_FRAME_WORK`.
     static SKIP_SETTLED: Cell<bool> = const { Cell::new(false) };
-
-    /// How many subtrees were skipped, to pick which ones to verify.
-    static SKIPPED: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Gotos skip settled objects unless `RUFFLE_GOTO_FULL_PASS=1` is set, to compare.
@@ -48,11 +46,12 @@ pub fn skips_frame_work(child: DisplayObject<'_>) -> bool {
     if !SKIP_SETTLED.get() || child.base().needs_frame_work() {
         return false;
     }
-    let skipped = SKIPPED.replace(SKIPPED.get().wrapping_add(1));
+    let skipped = telemetry::record_settled_skip();
     if (*GOTO_VERIFY_ALL || skipped.is_multiple_of(GOTO_VERIFY_SAMPLE))
         && let Some(unsettled) = find_unsettled(child)
     {
         // A state change that creates frame work isn't marking `NEEDS_FRAME_WORK`.
+        telemetry::record_settled_skip_violation();
         tracing::warn!(
             "Skipped frame work of {:?} (in {:?}), which isn't settled",
             unsettled
@@ -79,6 +78,7 @@ fn skips_settled_orphans(context: &mut UpdateContext<'_>) -> bool {
             unsettled = unsettled.or_else(|| find_unsettled(orphan));
         });
         if let Some(unsettled) = unsettled {
+            telemetry::record_settled_skip_violation();
             tracing::warn!(
                 "Skipped the orphan list, but {:?} isn't settled",
                 unsettled
@@ -243,6 +243,7 @@ fn run_inner_goto_frame_phases<'gc>(
 ) {
     let stage = context.stage;
     let old_phase = *context.frame_phase;
+    telemetry::record_goto();
 
     // When performing goto, frame scripts behave the same as when entering a new frame
     // so no separate cleanup is performed on ones registered during frame script phase
@@ -254,45 +255,54 @@ fn run_inner_goto_frame_phases<'gc>(
     let skip_orphans = skips_settled_orphans(context);
 
     *context.frame_phase = FramePhase::Construct;
-    if !skip_orphans {
+    telemetry::time_goto_part(GotoPart::OrphanConstruct, || {
+        if skip_orphans {
+            return;
+        }
         OrphanManager::each_orphan_obj(context, |orphan, context| {
             if !skips_frame_work(orphan) {
                 orphan.construct_frame(context);
             }
         });
-    }
-    stage.construct_frame(context);
-    broadcast_frame_constructed(context);
+    });
+    telemetry::time_goto_part(GotoPart::StageConstruct, || stage.construct_frame(context));
+    telemetry::time_goto_part(GotoPart::FrameConstructed, || {
+        broadcast_frame_constructed(context)
+    });
 
     *context.frame_phase = FramePhase::FrameScripts;
-    stage.run_frame_scripts(context);
-    if !skip_orphans {
-        let epoch = orphan_work_epoch();
-        let mut all_settled = true;
-        OrphanManager::each_orphan_obj(context, |orphan, context| {
-            if !skips_frame_work(orphan) {
-                orphan.run_frame_scripts(context);
+    telemetry::time_goto_part(GotoPart::StageScripts, || stage.run_frame_scripts(context));
+    telemetry::time_goto_part(GotoPart::OrphanScripts, || {
+        if !skip_orphans {
+            let epoch = orphan_work_epoch();
+            let mut all_settled = true;
+            OrphanManager::each_orphan_obj(context, |orphan, context| {
+                if !skips_frame_work(orphan) {
+                    orphan.run_frame_scripts(context);
+                }
+                all_settled &= !orphan.base().needs_frame_work();
+            });
+            if SKIP_SETTLED.get() && all_settled && orphan_work_epoch() == epoch {
+                context.orphan_manager.set_all_settled(epoch);
             }
-            all_settled &= !orphan.base().needs_frame_work();
-        });
-        if SKIP_SETTLED.get() && all_settled && orphan_work_epoch() == epoch {
-            context.orphan_manager.set_all_settled(epoch);
         }
-    }
 
-    for child in removed_frame_scripts {
-        child.run_frame_scripts(context);
-    }
+        for child in removed_frame_scripts {
+            child.run_frame_scripts(context);
+        }
+    });
 
     *context.frame_phase = FramePhase::Exit;
-    broadcast_frame_exited(context);
+    telemetry::time_goto_part(GotoPart::FrameExited, || broadcast_frame_exited(context));
 
     // We cannot easily remove dead `GcWeak` instances from the orphan list
     // inside `each_orphan_movie`, since the callback may modify the orphan list.
     // Instead, we do one cleanup at the end of the frame.
     // This performs special handling of clips which became orphaned as
     // a result of a RemoveObject tag - see `cleanup_dead_orphans` for details.
-    context.orphan_manager.cleanup_dead_orphans(context.gc());
+    telemetry::time_goto_part(GotoPart::Cleanup, || {
+        context.orphan_manager.cleanup_dead_orphans(context.gc())
+    });
 
     *context.frame_phase = old_phase;
 }

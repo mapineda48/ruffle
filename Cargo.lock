@@ -4971,6 +4971,7 @@ dependencies = [
  "ruffle_render_wgpu",
  "ruffle_video_external",
  "ruffle_video_software",
+ "rustc-demangle",
  "sys-locale",
  "thiserror 2.0.18",
  "tokio",

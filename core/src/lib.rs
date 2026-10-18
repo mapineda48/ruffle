@@ -44,6 +44,7 @@ mod streams;
 pub mod string;
 mod system_properties;
 pub mod tag_utils;
+pub mod telemetry;
 mod tessellation_cache;
 pub mod timer;
 mod types;
