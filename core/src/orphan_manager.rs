@@ -3,6 +3,7 @@
 use crate::context::UpdateContext;
 use crate::display_object::{DisplayObject, DisplayObjectWeak, TDisplayObject};
 use gc_arena::{Collect, Mutation};
+use std::collections::HashSet;
 use std::rc::Rc;
 
 /// The list of 'orphan' objects - these objects have no parent,
@@ -18,6 +19,11 @@ use std::rc::Rc;
 #[collect(no_drop)]
 pub struct OrphanManager<'gc> {
     orphans: Rc<Vec<DisplayObjectWeak<'gc>>>,
+
+    /// The addresses of the objects in `orphans`, to find duplicates without a linear scan.
+    /// GcWeak keeps its allocation alive, so an address can't be reused while it's in the list.
+    #[collect(require_static)]
+    orphan_ptrs: HashSet<usize>,
 }
 
 impl<'gc> OrphanManager<'gc> {
@@ -33,11 +39,7 @@ impl<'gc> OrphanManager<'gc> {
     pub fn add_orphan_obj(&mut self, dobj: DisplayObject<'gc>) {
         // Note: comparing pointers is correct because GcWeak keeps its allocation alive,
         // so the pointers can't overlap by accident.
-        if self
-            .orphans
-            .iter()
-            .all(|d| !std::ptr::eq(d.as_ptr(), dobj.as_ptr()))
-        {
+        if self.orphan_ptrs.insert(dobj.as_ptr() as usize) {
             self.orphans_mut().push(dobj.downgrade());
         }
     }
@@ -63,8 +65,9 @@ impl<'gc> OrphanManager<'gc> {
     /// that have been garbage collected, or are no longer orphans
     /// (they've since acquired a parent).
     pub fn cleanup_dead_orphans(&mut self, mc: &Mutation<'gc>) {
-        self.orphans_mut().retain(|d| {
-            if let Some(dobj) = valid_orphan(*d, mc) {
+        let orphan_ptrs = &mut self.orphan_ptrs;
+        Rc::make_mut(&mut self.orphans).retain(|d| {
+            let keep = if let Some(dobj) = valid_orphan(*d, mc) {
                 // All clips that become orphaned (have their parent removed, or start out with no parent)
                 // get added to the orphan list. However, there's a distinction between clips
                 // that are removed from a RemoveObject tag, and clips that are removed from ActionScript.
@@ -88,7 +91,11 @@ impl<'gc> OrphanManager<'gc> {
                 dobj.placed_by_avm2_script()
             } else {
                 false
+            };
+            if !keep {
+                orphan_ptrs.remove(&(d.as_ptr() as usize));
             }
+            keep
         });
     }
 }
@@ -97,6 +104,7 @@ impl<'gc> Default for OrphanManager<'gc> {
     fn default() -> Self {
         Self {
             orphans: Rc::new(Vec::new()),
+            orphan_ptrs: HashSet::new(),
         }
     }
 }
