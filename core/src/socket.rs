@@ -200,9 +200,18 @@ impl<'gc> Sockets<'gc> {
     }
 
     pub fn update_sockets(context: &mut UpdateContext<'gc>) {
-        let mut actions = vec![];
+        let mut actions: Vec<SocketAction> = vec![];
 
         while let Ok(action) = context.sockets.receiver.try_recv() {
+            // A socket is a stream, so consecutive reads of the same socket can be delivered
+            // in one data event. This saves running the handlers once per network read.
+            if let SocketAction::Data(handle, data) = &action
+                && let Some(SocketAction::Data(last_handle, last_data)) = actions.last_mut()
+                && last_handle == handle
+            {
+                last_data.extend_from_slice(data);
+                continue;
+            }
             actions.push(action)
         }
 

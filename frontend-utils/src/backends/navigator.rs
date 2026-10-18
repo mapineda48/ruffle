@@ -387,9 +387,8 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
             let (mut read, mut write) = stream.split();
 
             let read = async move {
+                let mut buffer = vec![0; 65536];
                 loop {
-                    let mut buffer = [0; 4096];
-
                     match read.read(&mut buffer).await {
                         Err(e) if e.kind() == ErrorKind::TimedOut => {} // try again later.
                         Err(_) | Ok(0) => {
@@ -397,9 +396,7 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
                             break;
                         }
                         Ok(read) => {
-                            let buffer = buffer.into_iter().take(read).collect::<Vec<_>>();
-
-                            let action = SocketAction::Data(handle, buffer);
+                            let action = SocketAction::Data(handle, buffer[..read].to_vec());
                             if !send_action(&sender, action).await {
                                 return;
                             }
