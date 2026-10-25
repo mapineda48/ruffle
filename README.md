@@ -1,3 +1,12 @@
+> [!WARNING]
+> **Local lab, nothing serious.** This is a personal fork of [Ruffle](https://github.com/ruffle-rs/ruffle)
+> used for experiments on my own machine. It is not maintained, not supported, and not an official proposal.
+> If you are looking for Ruffle, please use the upstream repository.
+>
+> Branch `avm2-uint-key-enumeration-order` (based on `v0.7.1`) makes AVM2 enumerate the integer keys of dynamic
+> objects in ascending order, matching Flash Player, plus a few experimental performance tweaks.
+> `backup/commits-v1` is a backup of an earlier version of those commits.
+
 <p align="center">
   <a href="https://ruffle.rs"><img alt="Ruffle" src="https://ruffle.rs/logo.svg" /></a>
 </p>
